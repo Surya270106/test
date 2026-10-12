@@ -1,0 +1,360 @@
+--- a/src/agent.py
++++ b/src/agent.py
+@@ -1190,7 +1190,21 @@
+     if full_backfill_audit is not None and full_backfill_audit["status"] != "COMPLETE":
+         passed = False
+     if not passed:
+-        final_text += "\n\n**RESULT: PARTIAL — evidence or retrieval validation failed.**" + quality_note
++        gate_detail = ""
++        if full_backfill_audit is not None and full_backfill_audit["status"] == "COMPLETE":
++            # The completeness audit and the report-quality gate are independent
++            # validations. Say which one failed instead of leaving a COMPLETE audit
++            # next to an unexplained PARTIAL.
++            failed_gates = [name for name, failed in (
++                ("target-local citation problems", bool(problems)),
++                ("report-quality warnings", bool(quality_note.strip())),
++                ("tool failures", bool(failures)),
++                ("tool availability issues", bool(availability_issues)),
++                ("retrieval error", bool(retrieval_error)),
++            ) if failed]
++            gate_detail = ("\n- Completeness audit status is COMPLETE; the report-quality gate failed on: "
++                           + (", ".join(failed_gates) or "an unspecified validation") + ".")
++        final_text += "\n\n**RESULT: PARTIAL — evidence or retrieval validation failed.**" + gate_detail + quality_note
+     else:
+         if focus == "Focused retrieval smoke":
+             final_text += "\n\n**RESULT: SMOKE PASS — one search and one fetch validated; this is not a full backfill.**"
+--- a/src/core.py
++++ b/src/core.py
+@@ -346,6 +346,26 @@
+     ]
+ 
+ 
++def _find_ledger_section_start(lines: list[str]) -> int | None:
++    """Locate the contribution-ledger section, ignoring the report's own title.
++
++    A top-level ``# Contribution Ledger`` title only counts as the ledger section
++    when list items follow it directly; otherwise the title's preamble (which ends
++    at the next heading) is not a ledger and must not trigger a link warning.
++    """
++    candidates = [i for i, line in enumerate(lines) if "contribution ledger" in line.casefold()]
++    for index in candidates:
++        if not re.match(r"^\s*#\s+\S", lines[index]):
++            return index
++    for index in candidates:
++        for line in lines[index + 1:]:
++            if re.match(r"^\s*(?:#{1,6}\s+|[3-9]\.\s+\*\*)", line):
++                break
++            if re.match(r"^\s*(?:[-*+]\s+|\d+[.)]\s+)", line):
++                return index
++    return None
++
++
+ def report_quality_note(
+     report: str,
+     observed_tool_text: str = "",
+@@ -390,7 +410,7 @@
+ 
+     # If the expected section is present, ensure at least one artifact link is near it.
+     lines = (report or "").splitlines()
+-    ledger_idx = next((i for i, line in enumerate(lines) if "contribution ledger" in line.casefold()), None)
++    ledger_idx = _find_ledger_section_start(lines)
+     if ledger_idx is not None:
+         end_idx = len(lines)
+         for i in range(ledger_idx + 1, len(lines)):
+--- a/src/tool_contract.py
++++ b/src/tool_contract.py
+@@ -1095,15 +1095,27 @@
+     for field_name, value in (("title", title), ("status", status), ("author", author)):
+         if value and value.casefold() not in source_text.casefold():
+             problems.append(f"observed {field_name} is not present in retrieved source text")
+-    paragraph = ""
++    required_fields = (("URL", expected_url), ("title", title), ("status", status), ("author", author))
++
++    def missing_fields(paragraph: str) -> list[str]:
++        return [name for name, value in required_fields if value and value.casefold() not in paragraph]
++
++    # Every required field must sit together in ONE block that cites the target.
++    # The block is chosen by completeness, not by being the first URL mention: an
++    # earlier brief mention (e.g. an executive summary) must not hide a complete
++    # target-local citation, while a report with no single complete block still fails.
++    best_missing = [name for name, value in required_fields if value]
+     if actual_url:
+         for block in re.split(r"\n\s*\n", report or ""):
+-            if actual_url.casefold() in block.casefold() or expected_url.casefold() in block.casefold():
+-                paragraph = block.casefold()
+-                break
+-    for field_name, value in (("URL", expected_url), ("title", title), ("status", status), ("author", author)):
+-        if value and value.casefold() not in paragraph:
+-            problems.append(f"target-local report citation is missing the observed {field_name}")
++            lowered = block.casefold()
++            if actual_url.casefold() in lowered or expected_url.casefold() in lowered:
++                missing = missing_fields(lowered)
++                if len(missing) < len(best_missing):
++                    best_missing = missing
++                if not best_missing:
++                    break
++    for field_name in best_missing:
++        problems.append(f"target-local report citation is missing the observed {field_name}")
+     return problems
+ 
+ 
+--- a/scripts/check_benchmark_report.py
++++ b/scripts/check_benchmark_report.py
+@@ -56,6 +56,89 @@
+     return "\n\n".join(item for item in paragraphs if item)
+ 
+ 
++# Cases whose required evidence may legitimately appear in more than one report
++# section, provided every section is explicitly anchored to the target artifact.
++# Identity checks (URL, title, author, status) always stay on the primary block.
++TARGET_LINKED_EVIDENCE_CASES = frozenset({"fastapi-15953"})
++
++_OTHER_ARTIFACT_PATH = re.compile(
++    r"^https?://github\.com/[^/\s]+/[^/\s]+/(?:pull|issues|commit|commits|releases|discussions|actions/runs)/",
++)
++_TEST_QUALIFIERS = (
++    "author-reported", "pr description", "not independently verified", "not separately verified",
++    "not independently reproduced", "source-reported",
++)
++_CI_SUCCESS_CLAIM = re.compile(
++    r"(?:\b52\s+(?:ci\s+)?checks?\s+passed\b|\bci\s+(?:checks?\s+)?(?:passed|succeeded|is green|was green)\b"
++    r"|\bchecks\s+(?:are\s+)?(?:all\s+)?green\b|\bverified\s+(?:by|in)\s+ci\b)"
++)
++_CI_NEGATION = re.compile(r"(?:\bnot\b|\bno\b|\bnor\b|\bwithout\b|\bunless\b|\bnever\b|n't)[^.;]{0,60}$")
++
++
++def _flexible_pattern(text: str) -> str:
++    """Match text tolerating whitespace introduced by terminal wrapping."""
++    return r"\s+".join(re.escape(part) for part in text.split())
++
++
++def _block_names_target(case: dict, block: str) -> bool:
++    """True when a block carries an explicit identity anchor for the target.
++
++    Anchors: the canonical URL (exact, not a longer number), the exact title, or
++    the repository together with the PR number written as ``#N``/``pull/N``.
++    """
++    lower = block.casefold()
++    url = case["artifact_url"].casefold().rstrip("/")
++    url_pattern = r"\s*".join(re.escape(char) for char in url) + r"(?![\w\-])"
++    if re.search(url_pattern, lower):
++        return True
++    if re.search(r"(?<![\w])" + _flexible_pattern(case["title"].casefold()) + r"(?![\w])", lower):
++        return True
++    number = str(case.get("artifact_number", ""))
++    repo = str(case.get("repo", "")).casefold()
++    return bool(number and repo and repo in lower
++                and re.search(rf"(?:#|pull/){re.escape(number)}(?!\d)", lower))
++
++
++def _block_mentions_other_artifact(case: dict, block: str) -> bool:
++    """True when a block also references a different GitHub artifact.
++
++    Such a block is ambiguous about which artifact a test count belongs to, so
++    it is never accepted as target-linked evidence (fail closed).
++    """
++    lower = block.casefold()
++    target_url = case["artifact_url"].casefold().rstrip("/")
++    number = str(case.get("artifact_number", ""))
++    for raw in re.findall(r"https?://[^\s<>\]\)\}\"']+", lower):
++        candidate = raw.rstrip(".,;:!?").rstrip("/")
++        if candidate == target_url or candidate.startswith((target_url + "/", target_url + "#", target_url + "?")):
++            continue
++        if _OTHER_ARTIFACT_PATH.match(candidate):
++            return True
++    for ref in re.findall(r"(?:#|\bpull/)(\d{3,})(?!\d)", lower):
++        if ref != number:
++            return True
++    return False
++
++
++def target_linked_blocks(case: dict, blocks: list[str]) -> list[str]:
++    """Return report blocks explicitly tied to the target and to no other artifact."""
++    return [block for block in blocks
++            if block.strip() and _block_names_target(case, block)
++            and not _block_mentions_other_artifact(case, block)]
++
++
++def _contains_fact(block: str, fact: str) -> bool:
++    return bool(re.search(r"(?<![\w.,])" + _flexible_pattern(fact.casefold()) + r"(?!\w)", block.casefold()))
++
++
++def _asserts_unqualified_ci_success(block: str) -> bool:
++    lower = block.casefold()
++    for match in _CI_SUCCESS_CLAIM.finditer(lower):
++        if not _CI_NEGATION.search(lower[max(0, match.start() - 80):match.start()]):
++            return True
++    return False
++
++
+ def evaluate(case: dict, report: str) -> list[tuple[bool, str]]:
+     normalized_report = _normalize_benchmark_transcript(report)
+     lower = normalized_report.casefold()
+@@ -150,16 +233,29 @@
+         "pydantic-v2-13-0-release-context": (("verified signature", "verified commit", "verified on github"),
+                                                 ("contributors", "multiple contributors", "individual contributors")),
+     }.get(case["id"], ())
++    linked_blocks = target_linked_blocks(case, blocks) if case["id"] in TARGET_LINKED_EVIDENCE_CASES else []
+     for alternatives in required_groups:
+-        present = any(fact in target_context or re.sub(r"\s+", "", fact.casefold()) in compact_target_context for fact in alternatives)
++        if case["id"] in TARGET_LINKED_EVIDENCE_CASES:
++            # Evidence may sit in any section that is explicitly anchored to the
++            # target and mentions no other artifact; the whole report is never searched.
++            present = any(_contains_fact(block, fact) for block in linked_blocks for fact in alternatives)
++        else:
++            present = any(fact in target_context or re.sub(r"\s+", "", fact.casefold()) in compact_target_context for fact in alternatives)
+         results.append((present, f"target-specific required evidence present: {' / '.join(alternatives)} (missing if absent)"))
+ 
+     if case["id"] == "fastapi-16159":
+         qualified = any(term in target_context for term in ("author-reported", "reported in the pr", "not independently verified", "not reproduced"))
+         results.append((qualified, "benchmark metrics are qualified as author-reported/unreproduced"))
+     if case["id"] == "fastapi-15953":
+-        test_qualified = any(term in target_context for term in ("author-reported", "pr description", "not independently verified", "not separately verified"))
+-        results.append((test_qualified, "test count is distinguished from separately verified CI"))
++        count_facts = required_groups[0] if required_groups else ()
++        # The qualification must sit in the same target-linked block as the test
++        # count it qualifies, and no linked block may claim independent CI success.
++        qualified_blocks = [block for block in linked_blocks
++                            if any(_contains_fact(block, fact) for fact in count_facts)
++                            and any(term in block.casefold() for term in _TEST_QUALIFIERS)]
++        ci_overclaim = any(_asserts_unqualified_ci_success(block) for block in linked_blocks)
++        results.append((bool(qualified_blocks) and not ci_overclaim,
++                        "test count is distinguished from separately verified CI"))
+     if case["id"] == "pydantic-v2-13-0-release-context":
+         disclaimers = ("does not establish that", "does not prove that", "not evidence that",
+                        "must not be credited with", "do not attribute", "not attributable to",
+--- a/tests/test_benchmark_checker.py
++++ b/tests/test_benchmark_checker.py
+@@ -378,3 +378,132 @@
+     assert not all(passed for passed, _ in checks)
+     assert not next(passed for passed, label in checks if "status is COMPLETE" in label)
+     assert not next(passed for passed, label in checks if "zero-contribution result" in label)
++
++
++# --- target-linked evidence for fastapi-15953 ------------------------------------------------------------
++
++_P_URL = "https://github.com/fastapi/fastapi/pull/15953"
++_P_TITLE = "Document custom headers for JSONL and SSE streams"
++_P_SUMMARY = (f"**Target:** [{_P_TITLE}]({_P_URL}) — PR #15953 by Deadshot1831, currently open "
++              "(proposed, not merged).")
++_P_SIGNAL = ("## Engineering and collaboration signal\n- The PR page reports `+263 -0 in 6 files`. The author's "
++             "validation statement: 52 tests passed, Ruff checks passed. These results are author-reported, not "
++             f"independently reproduced here. [PR #15953]({_P_URL})")
++_P_ADDENDUM = (f"### Exact target artifact verification\n\n**Exact fetched target:** [{_P_TITLE}]({_P_URL}); "
++               f"Observed title: {_P_TITLE}; Displayed author/login: Deadshot1831; Observed status: open; "
++               "Verbatim fetched source excerpt (untrusted page text): \"pytest ... 52 passed\"; Evidence limit: "
++               "Test counts are source-reported and not independently verified unless separately checked.")
++_TEST_LABEL = "52 passed / 52 tests passed / 52 passing"
++_QUAL_LABEL = "test count is distinguished from separately verified CI"
++
++
++def _p_report(*blocks: str) -> str:
++    return "# Contribution Ledger\n\n" + "\n\n".join(blocks) + "\n"
++
++
++def _p_status(report: str) -> dict[str, bool]:
++    case = checker.load_cases()["fastapi-15953"]
++    return {label: passed for passed, label in checker.evaluate(case, report)}
++
++
++def _p_evidence_checks(report: str) -> tuple[bool, bool]:
++    results = _p_status(report)
++    count = next(v for k, v in results.items() if _TEST_LABEL in k)
++    qual = next(v for k, v in results.items() if _QUAL_LABEL in k)
++    return count, qual
++
++
++def test_fastapi_15953_test_evidence_found_in_later_target_linked_sections():
++    report = _p_report(_P_SUMMARY, "Filler paragraph.", _P_SIGNAL, _P_ADDENDUM)
++    assert all(_p_status(report).values())
++
++
++def test_fastapi_15953_test_evidence_accepted_from_signal_section_alone():
++    assert _p_evidence_checks(_p_report(_P_SUMMARY, _P_SIGNAL)) == (True, True)
++
++
++def test_fastapi_15953_test_evidence_accepted_from_addendum_alone():
++    assert _p_evidence_checks(_p_report(_P_SUMMARY, _P_ADDENDUM)) == (True, True)
++
++
++def test_fastapi_15953_missing_test_count_still_fails():
++    signal = _P_SIGNAL.replace("52 tests passed", "all tests passed")
++    addendum = _P_ADDENDUM.replace("52 passed", "tests ran")
++    count, _ = _p_evidence_checks(_p_report(_P_SUMMARY, signal, addendum))
++    assert count is False
++
++
++def test_fastapi_15953_unqualified_test_claim_still_fails():
++    signal = ("## Signal\n- Validation: 52 tests passed. [PR #15953](" + _P_URL + ")")
++    count, qual = _p_evidence_checks(_p_report(_P_SUMMARY, signal))
++    assert count is True and qual is False
++
++
++def test_fastapi_15953_qualifier_must_be_in_same_block_as_the_count():
++    count_only = f"- Validation: 52 tests passed. [PR #15953]({_P_URL})"
++    qualifier_only = f"- The author's claims are author-reported and unverified. [PR #15953]({_P_URL})"
++    count, qual = _p_evidence_checks(_p_report(_P_SUMMARY, count_only, qualifier_only))
++    assert count is True and qual is False
++
++
++def test_fastapi_15953_unrelated_artifact_cannot_supply_test_count_or_qualification():
++    other = ("## Other work\n- A different PR reports 52 tests passed; this is author-reported. "
++             "[PR #15954](https://github.com/fastapi/fastapi/pull/15954)")
++    assert _p_evidence_checks(_p_report(_P_SUMMARY, other)) == (False, False)
++
++
++def test_fastapi_15953_unanchored_paragraph_cannot_supply_test_count():
++    unanchored = "## Elsewhere\n- 52 tests passed, author-reported."
++    assert _p_evidence_checks(_p_report(_P_SUMMARY, unanchored)) == (False, False)
++
++
++def test_fastapi_15953_block_mixing_target_and_other_artifact_is_not_accepted():
++    mixed = (f"- [PR #15953]({_P_URL}) and [PR #15954](https://github.com/fastapi/fastapi/pull/15954): "
++             "52 tests passed, author-reported.")
++    assert _p_evidence_checks(_p_report(_P_SUMMARY, mixed)) == (False, False)
++
++
++def test_fastapi_15953_longer_pr_number_url_is_not_the_target():
++    wrong = ("- 52 tests passed, author-reported. [PR](https://github.com/fastapi/fastapi/pull/159530)")
++    assert _p_evidence_checks(_p_report(_P_SUMMARY, wrong)) == (False, False)
++
++
++def test_fastapi_15953_repo_and_number_anchor_without_url_is_accepted():
++    block = "- In fastapi/fastapi, PR #15953 reports 52 tests passed; this is author-reported."
++    assert _p_evidence_checks(_p_report(_P_SUMMARY, block)) == (True, True)
++
++
++def test_fastapi_15953_independent_ci_success_claim_fails_qualification():
++    claim = f"- All 52 CI checks passed and tests were author-reported. [PR #15953]({_P_URL})"
++    _, qual = _p_evidence_checks(_p_report(_P_SUMMARY, _P_SIGNAL, claim))
++    assert qual is False
++
++
++def test_fastapi_15953_negated_ci_statement_does_not_fail_qualification():
++    note = f"- No independent CI result was verified; 52 tests passed is author-reported. [PR #15953]({_P_URL})"
++    assert _p_evidence_checks(_p_report(_P_SUMMARY, note)) == (True, True)
++
++
++def _p_check(report: str, fragment: str) -> bool:
++    case = checker.load_cases()["fastapi-15953"]
++    matches = [passed for passed, label in checker.evaluate(case, report) if fragment in label]
++    assert len(matches) == 1, (fragment, matches)
++    return matches[0]
++
++
++def test_fastapi_15953_primary_identity_checks_remain_strict_with_good_later_sections():
++    # A valid later signal section cannot rescue a bad primary target block. (The machine-generated
++    # addendum is deliberately omitted here: it carries the observed identity itself and is a valid primary.)
++    wrong_title = f"**Target:** [Some other title]({_P_URL}) by Deadshot1831, open."
++    no_author = f"**Target:** [{_P_TITLE}]({_P_URL}) is open."
++    no_status = f"**Target:** [{_P_TITLE}]({_P_URL}) by Deadshot1831."
++    merged = f"**Target:** [{_P_TITLE}]({_P_URL}) by Deadshot1831 was merged into main and shipped."
++
++    assert _p_check(_p_report(wrong_title, _P_SIGNAL), "exact target title") is False
++    assert _p_check(_p_report(no_author, _P_SIGNAL), "author attribution") is False
++    assert _p_check(_p_report(no_status, _P_SIGNAL), "open/proposed status") is False
++    assert _p_check(_p_report(merged, _P_SIGNAL), "does not contradict open PR") is False
++    # Control: the valid primary block passes all four identity/status checks.
++    good = _p_report(_P_SUMMARY, _P_SIGNAL, _P_ADDENDUM)
++    for fragment in ("exact target title", "author attribution", "open/proposed status", "does not contradict open PR"):
++        assert _p_check(good, fragment) is True
